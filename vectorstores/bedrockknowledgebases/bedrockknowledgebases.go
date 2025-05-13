@@ -2,6 +2,7 @@ package bedrockknowledgebases
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -97,40 +98,30 @@ func (kb *KnowledgeBase) AddNamedDocuments(ctx context.Context, docs []NamedDocu
 }
 
 func (kb *KnowledgeBase) filterMetadata(docs []NamedDocument) {
-	for i, doc := range docs {
-		if doc.Document.Metadata != nil {
-			for k, v := range doc.Document.Metadata {
-				if v == nil {
+	for _, doc := range docs {
+		for k, v := range doc.Document.Metadata {
+			if v == nil {
+				delete(doc.Document.Metadata, k)
+				continue
+			}
+
+			rv := reflect.ValueOf(v)
+			// nolint:exhaustive
+			switch rv.Kind() {
+			case reflect.Map, reflect.Slice:
+				if rv.Len() == 0 {
 					delete(doc.Document.Metadata, k)
-					continue
 				}
-
-				rv := reflect.ValueOf(v)
-				switch rv.Kind() {
-				case reflect.Map:
-					if rv.Len() == 0 {
-						delete(doc.Document.Metadata, k)
-					}
-				case reflect.Slice:
-					if rv.Len() == 0 {
-						delete(doc.Document.Metadata, k)
-					}
-				case reflect.String:
-					if v == "" {
-						delete(doc.Document.Metadata, k)
-					}
+			case reflect.String:
+				if v == "" {
+					delete(doc.Document.Metadata, k)
 				}
 			}
-
-			if len(doc.Document.Metadata) == 0 {
-				doc.Document.Metadata = nil
-			}
-
-			docs[i] = doc
 		}
 	}
 }
 
+// nolint:cyclop,funlen
 func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
 	opts := kb.getOptions(options...)
 
@@ -148,32 +139,43 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 				"found data sources but none with S3 type, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
 				kb.knowledgeBaseID,
 			)
-		} else {
-			return nil, fmt.Errorf(
-				"no data sources with S3 type found, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
-				kb.knowledgeBaseID,
-			)
 		}
+
+		return nil, fmt.Errorf(
+			"no data sources with S3 type found, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
+			kb.knowledgeBaseID,
+		)
 	}
 
 	var datasourceID string
 	var bucketARN string
-	if opts.NameSpace != "" {
+	switch {
+	case opts.NameSpace != "":
+		// User explicitly specified a namespace - find it
 		for _, ds := range compatibleDs {
-			if ds.Id == opts.NameSpace {
-				datasourceID = ds.Id
+			if ds.ID == opts.NameSpace {
+				datasourceID = ds.ID
 				bucketARN = ds.BucketARN
 				break
 			}
 		}
 		if datasourceID == "" {
-			return nil, fmt.Errorf("data source with S3 type with id %s not found", opts.NameSpace)
+			return nil, fmt.Errorf(
+				"data source with S3 type with id %q not found",
+				opts.NameSpace,
+			)
 		}
-	} else if len(compatibleDs) == 1 {
-		datasourceID = compatibleDs[0].Id
+
+	case len(compatibleDs) == 1:
+		// Only one compatible data source, so use that
+		datasourceID = compatibleDs[0].ID
 		bucketARN = compatibleDs[0].BucketARN
-	} else {
-		return nil, fmt.Errorf("multiple data sources with S3 type found, please specify which one you want to use by passing its id with the `vectorstores.WithNameSpace` option")
+
+	default:
+		// Ambiguous - need namespace to disambiguate
+		return nil, fmt.Errorf(
+			"multiple data sources with S3 type found, please specify which one you want to use by passing its id with the `vectorstores.WithNameSpace` option",
+		)
 	}
 
 	if err := kb.addToS3(ctx, bucketARN, docs); err != nil {
@@ -181,7 +183,12 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 	}
 
 	if err := kb.ingestDocuments(ctx, datasourceID, bucketARN, docs); err != nil {
-		kb.removeFromS3(ctx, bucketARN, docs)
+		if removeErr := kb.removeFromS3(ctx, bucketARN, docs); removeErr != nil {
+			return nil, fmt.Errorf(
+				"failed to ingest documents: %w",
+				errors.Join(err, removeErr),
+			)
+		}
 		return nil, fmt.Errorf("failed to ingest documents: %w", err)
 	}
 
@@ -263,6 +270,7 @@ func (kb *KnowledgeBase) SimilaritySearch(ctx context.Context, query string, num
 	return docs, nil
 }
 
+// nolint:gocognit,cyclop,funlen
 func (kb *KnowledgeBase) getFilters(filters any) (types.RetrievalFilter, error) {
 	if filters != nil {
 		switch filters := filters.(type) {
@@ -300,6 +308,7 @@ func (kb *KnowledgeBase) getFilters(filters any) (types.RetrievalFilter, error) 
 			}
 			switch len(filtersList) {
 			case 0:
+				// nolint:nilnil
 				return nil, nil
 			case 1:
 				return filtersList[0], nil
@@ -321,6 +330,7 @@ func (kb *KnowledgeBase) getFilters(filters any) (types.RetrievalFilter, error) 
 			}
 			switch len(filtersList) {
 			case 0:
+				// nolint:nilnil
 				return nil, nil
 			case 1:
 				return filtersList[0], nil
@@ -334,6 +344,7 @@ func (kb *KnowledgeBase) getFilters(filters any) (types.RetrievalFilter, error) 
 		}
 	}
 
+	// nolint:nilnil
 	return nil, nil
 }
 
@@ -366,14 +377,13 @@ func (kb *KnowledgeBase) unmarshalMetadataValue(value document.Interface) (any, 
 	if err := value.UnmarshalSmithyDocument(&v); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal metadata value: %w", err)
 	}
-	switch value := v.(type) {
-	// convert to float 32 for easier handling by the user
-	case smithyDocument.Number:
-		floatValue, err := value.Float32()
+	if num, ok := v.(smithyDocument.Number); ok {
+		// convert to float32 for easier handling by the user
+		f, err := num.Float32()
 		if err != nil {
 			return nil, err
 		}
-		return float32(floatValue), nil
+		return float32(f), nil
 	}
 	return v, nil
 }

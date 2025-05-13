@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -47,13 +46,11 @@ func (kb *KnowledgeBase) addToS3(ctx context.Context, bucketArn string, docs []N
 	return uploadDocs.Wait()
 }
 
-func (kb *KnowledgeBase) removeFromS3(ctx context.Context, bucketArn string, docs []NamedDocument) {
+func (kb *KnowledgeBase) removeFromS3(ctx context.Context, bucketArn string, docs []NamedDocument) error {
 	sem := semaphore.NewWeighted(kb.s3Config.maxConcurrency)
-	var wg sync.WaitGroup
+	removeFromS3, ctx := eg.WithContext(ctx)
 	for _, doc := range docs {
-		wg.Add(1)
-		go func() error {
-			defer wg.Done()
+		removeFromS3.Go(func() error {
 			if err := sem.Acquire(ctx, 1); err != nil {
 				return fmt.Errorf("failed to acquire semaphore: %w", err)
 			}
@@ -63,9 +60,12 @@ func (kb *KnowledgeBase) removeFromS3(ctx context.Context, bucketArn string, doc
 				return fmt.Errorf("failed to upload document: %w", err)
 			}
 			return nil
-		}()
+		})
 	}
-	wg.Wait()
+	if err := removeFromS3.Wait(); err != nil {
+		return fmt.Errorf("failed to remove documents from S3: %w", err)
+	}
+	return nil
 }
 
 // uploadS3 uploads the provided file content to the specified S3 bucket and key.
