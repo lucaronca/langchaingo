@@ -103,44 +103,65 @@ func processMessages(messages []llms.MessageContent) ([]bedrockclient.Message, e
 
 	for _, m := range messages {
 		for _, part := range m.Parts {
-			switch part := part.(type) {
-			case llms.TextContent:
-				bedrockMsgs = append(bedrockMsgs, bedrockclient.Message{
-					Role:    m.Role,
-					Content: part.Text,
-					Type:    "text",
-				})
-			case llms.BinaryContent:
-				bedrockMsgs = append(bedrockMsgs, bedrockclient.Message{
-					Role:     m.Role,
-					Content:  string(part.Data),
-					MimeType: part.MIMEType,
-					Type:     "image",
-				})
-			case llms.ToolCall:
-				// Handle tool calls from AI messages
-				bedrockMsgs = append(bedrockMsgs, bedrockclient.Message{
-					Role:       m.Role,
-					Content:    "", // Content will be empty for tool calls
-					Type:       "tool_call",
-					ToolCallID: part.ID,
-					ToolName:   part.FunctionCall.Name,
-					ToolArgs:   part.FunctionCall.Arguments,
-				})
-			case llms.ToolCallResponse:
-				// Handle tool result messages
-				bedrockMsgs = append(bedrockMsgs, bedrockclient.Message{
-					Role:      m.Role,
-					Content:   part.Content,
-					Type:      "tool_result",
-					ToolUseID: part.ToolCallID,
-				})
-			default:
-				return nil, errors.New("unsupported message type")
+			msg, err := partToMessage(m.Role, part)
+			if err != nil {
+				return nil, err
 			}
+			bedrockMsgs = append(bedrockMsgs, msg)
 		}
 	}
 	return bedrockMsgs, nil
+}
+
+// partToMessage converts a single llms.ContentPart into the flat
+// bedrockclient.Message representation. llms.CachedContent is unwrapped and
+// its CacheControl is attached to the resulting Message; providers that
+// support prompt caching translate that field into their wire format,
+// providers that don't simply ignore it.
+func partToMessage(role llms.ChatMessageType, part llms.ContentPart) (bedrockclient.Message, error) {
+	var cacheControl *llms.CacheControl
+	if cached, ok := part.(llms.CachedContent); ok {
+		cacheControl = cached.CacheControl
+		part = cached.ContentPart
+	}
+
+	switch p := part.(type) {
+	case llms.TextContent:
+		return bedrockclient.Message{
+			Role:         role,
+			Content:      p.Text,
+			Type:         "text",
+			CacheControl: cacheControl,
+		}, nil
+	case llms.BinaryContent:
+		return bedrockclient.Message{
+			Role:         role,
+			Content:      string(p.Data),
+			MimeType:     p.MIMEType,
+			Type:         "image",
+			CacheControl: cacheControl,
+		}, nil
+	case llms.ToolCall:
+		return bedrockclient.Message{
+			Role:         role,
+			Content:      "", // Content will be empty for tool calls
+			Type:         "tool_call",
+			ToolCallID:   p.ID,
+			ToolName:     p.FunctionCall.Name,
+			ToolArgs:     p.FunctionCall.Arguments,
+			CacheControl: cacheControl,
+		}, nil
+	case llms.ToolCallResponse:
+		return bedrockclient.Message{
+			Role:         role,
+			Content:      p.Content,
+			Type:         "tool_result",
+			ToolUseID:    p.ToolCallID,
+			CacheControl: cacheControl,
+		}, nil
+	default:
+		return bedrockclient.Message{}, errors.New("unsupported message type")
+	}
 }
 
 var _ llms.Model = (*LLM)(nil)
