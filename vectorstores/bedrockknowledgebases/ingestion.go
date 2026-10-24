@@ -22,8 +22,7 @@ import (
 )
 
 const (
-	_metadataSuffix                      = ".metadata.json"
-	_initialIngestionJobStatusRetryDelay = 1*time.Second + 250*time.Millisecond
+	_metadataSuffix = ".metadata.json"
 )
 
 // dataSource represents a data source for a knowledge base.
@@ -225,30 +224,53 @@ func (kb *KnowledgeBase) startIngestionJob(ctx context.Context, datasourceID str
 	return aws.ToString(result.IngestionJob.IngestionJobId), nil
 }
 
-func (kb *KnowledgeBase) checkIngestionJobStatus(ctx context.Context, datasourceID, ingestionJobID string) error {
-	maxRetries := 8
-	delay := _initialIngestionJobStatusRetryDelay
-
-	// If the ingestion job is still running, retry with exponential backoff
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		time.Sleep(delay)
-
-		result, err := kb.bedrockAgent.GetIngestionJob(ctx, &bedrockagent.GetIngestionJobInput{
-			KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
-			DataSourceId:    aws.String(datasourceID),
-			IngestionJobId:  aws.String(ingestionJobID),
-		})
-		if err != nil {
-			return fmt.Errorf("failed to get ingestion job: %w", err)
-		}
-		if result.IngestionJob.Status == types.IngestionJobStatusComplete {
-			return nil
-		}
-		if result.IngestionJob.Status == "COMPLETE" {
-			return nil
-		}
-		delay *= 2
+// StartSync triggers a Bedrock ingestion job for the given data source and waits for it to complete.
+// Call this once after all documents have been uploaded across all ingestion tasks.
+func (kb *KnowledgeBase) StartSync(ctx context.Context, datasourceID string) error {
+	ingestionJobID, err := kb.startIngestionJob(ctx, datasourceID)
+	if err != nil {
+		return fmt.Errorf(
+			"failed to start ingestion job, please retry or manually sync from the AWS console: %w",
+			err,
+		)
 	}
+	if err := kb.checkIngestionJobStatus(ctx, datasourceID, ingestionJobID); err != nil {
+		return fmt.Errorf(
+			"failed to check ingestion status, please retry or manually sync from the AWS console: %w",
+			err,
+		)
+	}
+	return nil
+}
 
-	return fmt.Errorf("exceeded maximum number of retries (%d)", maxRetries)
+func (kb *KnowledgeBase) checkIngestionJobStatus(ctx context.Context, datasourceID, ingestionJobID string) error {
+	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
+	defer cancel()
+
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("ingestion job status check timed out")
+		case <-ticker.C:
+			result, err := kb.bedrockAgent.GetIngestionJob(ctx, &bedrockagent.GetIngestionJobInput{
+				KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
+				DataSourceId:    aws.String(datasourceID),
+				IngestionJobId:  aws.String(ingestionJobID),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to get ingestion job: %w", err)
+			}
+			switch result.IngestionJob.Status {
+			case types.IngestionJobStatusFailed:
+				return fmt.Errorf("ingestion job failed: %v", result.IngestionJob.FailureReasons)
+			case types.IngestionJobStatusComplete:
+				return nil
+			case types.IngestionJobStatusStopped:
+				return fmt.Errorf("ingestion job stopped")
+			}
+		}
+	}
 }

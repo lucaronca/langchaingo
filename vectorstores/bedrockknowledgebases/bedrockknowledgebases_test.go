@@ -293,6 +293,18 @@ func TestKnowledgeBaseAddNamedDocuments(t *testing.T) {
 	require.Equal(t, "Mock", ids[0], "expected id to be 'Mock'")
 }
 
+func TestStartSync(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+
+	agent := &testBedrockAgent{}
+	kb := newFromClients("testKbId", agent, &testBedrockAgentRuntime{}, &testS3Client{})
+
+	err := kb.StartSync(ctx, "testS3DatasourceID")
+	require.NoError(t, err)
+	require.Equal(t, 2, agent.calls, "expected 2 calls: StartIngestionJob + GetIngestionJob")
+}
+
 func TestKnowledgeBaseSimilaritySearch(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()
