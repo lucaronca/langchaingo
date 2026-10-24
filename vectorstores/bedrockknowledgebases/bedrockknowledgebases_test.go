@@ -200,7 +200,7 @@ func TestKnowledgeBaseAddDocuments(t *testing.T) {
 
 	ids, err := kb.AddDocuments(ctx, []schema.Document{{PageContent: "Mock"}})
 	require.NoError(t, err)
-	require.Equal(t, 6, testBedrockAgent.calls, "expected 6 calls to testBedrockAgent")
+	require.Equal(t, 4, testBedrockAgent.calls, "expected 4 calls to testBedrockAgent")
 	require.Equal(t, 1, s3Client.calls, "expected 1 call to s3Client")
 	require.Len(t, ids, 1, "expected 1 id")
 }
@@ -239,7 +239,7 @@ func TestKnowledgeBaseAddDocumentsWithMultipleDs(t *testing.T) {
 
 	ids, err := kb.AddDocuments(ctx, []schema.Document{{PageContent: "Mock"}}, vectorstores.WithNameSpace("testS3DatasourceID"))
 	require.NoError(t, err)
-	require.Equal(t, 7, testBedrockAgent.calls, "expected 7 calls to testBedrockAgent")
+	require.Equal(t, 5, testBedrockAgent.calls, "expected 5 calls to testBedrockAgent")
 	require.Equal(t, 1, s3Client.calls, "expected 1 call to s3Client")
 	require.Len(t, ids, 1, "expected 1 id")
 }
@@ -254,7 +254,7 @@ func TestKnowledgeBaseAddDocumentsWithMultipleMixedDs(t *testing.T) {
 
 	ids, err := kb.AddDocuments(ctx, []schema.Document{{PageContent: "Mock"}})
 	require.NoError(t, err)
-	require.Equal(t, 7, testBedrockAgent.calls, "expected 7 calls to testBedrockAgent")
+	require.Equal(t, 5, testBedrockAgent.calls, "expected 5 calls to testBedrockAgent")
 	require.Equal(t, 1, s3Client.calls, "expected 1 call to s3Client")
 	require.Len(t, ids, 1, "expected 1 id")
 }
@@ -287,10 +287,22 @@ func TestKnowledgeBaseAddNamedDocuments(t *testing.T) {
 		},
 	)
 	require.NoError(t, err)
-	require.Equal(t, 6, testBedrockAgent.calls, "expected 6 calls to testBedrockAgent")
+	require.Equal(t, 4, testBedrockAgent.calls, "expected 4 calls to testBedrockAgent")
 	require.Equal(t, 1, s3Client.calls, "expected 1 call to s3Client")
 	require.Len(t, ids, 1, "expected 1 id")
 	require.Equal(t, "Mock", ids[0], "expected id to be 'Mock'")
+}
+
+func TestStartSync(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+
+	agent := &testBedrockAgent{}
+	kb := newFromClients("testKbId", agent, &testBedrockAgentRuntime{}, &testS3Client{})
+
+	err := kb.StartSync(ctx, "testS3DatasourceID")
+	require.NoError(t, err)
+	require.Equal(t, 2, agent.calls, "expected 2 calls: StartIngestionJob + GetIngestionJob")
 }
 
 func TestKnowledgeBaseSimilaritySearch(t *testing.T) {
