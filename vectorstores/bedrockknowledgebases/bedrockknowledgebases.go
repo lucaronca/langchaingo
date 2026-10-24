@@ -131,32 +131,27 @@ func (kb *KnowledgeBase) filterMetadata(docs []NamedDocument) {
 	}
 }
 
-func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
-	opts := kb.getOptions(options...)
-
-	kb.filterMetadata(docs)
-	if err := kb.checkKnowledgeBase(ctx); err != nil {
-		return nil, fmt.Errorf("failed to validate knowledge base: %w", err)
+func (kb *KnowledgeBase) resolveAndUpload(ctx context.Context, docs []NamedDocument, opts *vectorstores.Options) (datasourceID, bucketARN string, names []string, err error) {
+	if err = kb.checkKnowledgeBase(ctx); err != nil {
+		return "", "", nil, fmt.Errorf("failed to validate knowledge base: %w", err)
 	}
 	compatibleDs, incompatibleDs, err := kb.listDataSources(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list data sources: %w", err)
+		return "", "", nil, fmt.Errorf("failed to list data sources: %w", err)
 	}
 	if len(compatibleDs) == 0 {
 		if len(incompatibleDs) > 0 {
-			return nil, fmt.Errorf(
+			return "", "", nil, fmt.Errorf(
 				"found data sources but none with S3 type, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
 				kb.knowledgeBaseID,
 			)
 		}
-		return nil, fmt.Errorf(
+		return "", "", nil, fmt.Errorf(
 			"no data sources with S3 type found, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
 			kb.knowledgeBaseID,
 		)
 	}
 
-	var datasourceID string
-	var bucketARN string
 	if opts.NameSpace != "" {
 		for _, ds := range compatibleDs {
 			if ds.ID == opts.NameSpace {
@@ -166,42 +161,48 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 			}
 		}
 		if datasourceID == "" {
-			return nil, fmt.Errorf("data source with S3 type with id %s not found", opts.NameSpace)
+			return "", "", nil, fmt.Errorf("data source with S3 type with id %s not found", opts.NameSpace)
 		}
 	} else if len(compatibleDs) == 1 {
 		datasourceID = compatibleDs[0].ID
 		bucketARN = compatibleDs[0].BucketARN
 	} else {
-		return nil, fmt.Errorf("multiple data sources with S3 type found, please specify which one you want to use by passing its id with the `vectorstores.WithNameSpace` option")
+		return "", "", nil, fmt.Errorf("multiple data sources with S3 type found, please specify which one you want to use by passing its id with the `vectorstores.WithNameSpace` option")
 	}
 
-	if err := kb.addToS3(ctx, bucketARN, docs); err != nil {
-		return nil, fmt.Errorf("failed to upload documents to S3: %w", err)
+	if err = kb.addToS3(ctx, bucketARN, docs); err != nil {
+		return "", "", nil, fmt.Errorf("failed to upload documents to S3: %w", err)
 	}
 
+	names = make([]string, len(docs))
+	for i, doc := range docs {
+		names[i] = doc.Name
+	}
+	return datasourceID, bucketARN, names, nil
+}
+
+func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
+	opts := kb.getOptions(options...)
+	kb.filterMetadata(docs)
+	datasourceID, bucketARN, names, err := kb.resolveAndUpload(ctx, docs, opts)
+	if err != nil {
+		return nil, err
+	}
 	if err := kb.ingestDocuments(ctx, datasourceID, bucketARN, docs); err != nil {
 		kb.removeFromS3(ctx, bucketARN, docs)
 		return nil, fmt.Errorf("failed to ingest documents: %w", err)
 	}
+	return names, nil
+}
 
-	ingestionJobID, err := kb.startIngestionJob(ctx, datasourceID)
+// UploadNamedDocuments uploads docs to S3 without triggering per-document Bedrock ingestion.
+// Pair with StartSync once all data sources have been uploaded.
+func (kb *KnowledgeBase) UploadNamedDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
+	opts := kb.getOptions(options...)
+	kb.filterMetadata(docs)
+	_, _, names, err := kb.resolveAndUpload(ctx, docs, opts)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"failed to start ingestion job. Documents are correctly loaded, please retry or manually sync the knowledgebase from the AWS console. error: %w",
-			err,
-		)
-	}
-
-	if err := kb.checkIngestionJobStatus(ctx, datasourceID, ingestionJobID); err != nil {
-		return nil, fmt.Errorf(
-			"failed to check ingestion status. Documents are correctly loaded, please retry or manually sync the knowledgebase from the AWS console. error: %w",
-			err,
-		)
-	}
-
-	names := make([]string, len(docs))
-	for i, doc := range docs {
-		names[i] = doc.Name
+		return nil, err
 	}
 	return names, nil
 }
