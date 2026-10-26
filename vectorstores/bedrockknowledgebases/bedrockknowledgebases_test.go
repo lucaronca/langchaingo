@@ -3,6 +3,9 @@ package bedrockknowledgebases
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -330,6 +333,38 @@ func TestKnowledgeBaseSimilaritySearchWithScoreThreshold(t *testing.T) {
 	require.Len(t, docs, 2, "expected 2 documents")
 	require.Equal(t, "The color of the house is blue.", docs[0].PageContent, "expected content to be 'The color of the house is blue.'")
 	require.Equal(t, "The color of the car is red.", docs[1].PageContent, "expected content to be 'The color of the car is red.'")
+}
+
+type retrieveResponseClient struct{ body string }
+
+func (c retrieveResponseClient) Do(*http.Request) (*http.Response, error) {
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(c.body)),
+	}, nil
+}
+
+func TestKnowledgeBaseSimilaritySearchWithNumericMetadata(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+
+	runtimeClient := bedrockagentruntime.New(bedrockagentruntime.Options{
+		Region:      "us-east-1",
+		Credentials: aws.AnonymousCredentials{},
+		HTTPClient: retrieveResponseClient{body: `{"retrievalResults": [{
+			"content": {"text": "The color of the house is blue."},
+			"location": {"type": "S3", "s3Location": {"uri": "s3://testBucket/house.txt"}},
+			"metadata": {"document-chunk-index": 2},
+			"score": 0.9
+		}]}`},
+	})
+	kb := newFromClients("testKbId", &testBedrockAgent{}, runtimeClient, &testS3Client{})
+
+	docs, err := kb.SimilaritySearch(ctx, "What color is the house?", 5)
+	require.NoError(t, err)
+	require.Len(t, docs, 1, "expected 1 document")
+	require.Equal(t, float32(2), docs[0].Metadata["document-chunk-index"], "expected numeric metadata as float32")
 }
 
 func TestKnowledgeBaseSimilaritySearchWithFilter(t *testing.T) {

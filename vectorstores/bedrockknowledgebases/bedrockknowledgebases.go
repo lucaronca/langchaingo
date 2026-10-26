@@ -361,6 +361,8 @@ func (kb *KnowledgeBase) unmarshalMetadataValue(value document.Interface) (any, 
 			return nil, err
 		}
 		return float32(floatValue), nil
+	case float64:
+		return float32(value), nil
 	}
 	return v, nil
 }
