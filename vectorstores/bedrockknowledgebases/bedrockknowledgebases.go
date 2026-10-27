@@ -2,6 +2,7 @@ package bedrockknowledgebases
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -209,15 +210,17 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 		return nil, err
 	}
 
-	if err := kb.addToS3(ctx, ds.BucketARN, docs); err != nil {
-		return nil, fmt.Errorf("failed to upload documents to S3: %w", err)
+	if err := kb.upload(ctx, ds.BucketARN, docs); err != nil {
+		return nil, err
 	}
 
 	if !synced {
 		ingestionJobID, err := kb.startIngestionJob(ctx, ds.ID)
 		if err != nil {
-			kb.removeFromS3(ctx, ds.BucketARN, docs)
-			return nil, fmt.Errorf("failed to start the first sync of the data source: %w", err)
+			return nil, errors.Join(
+				fmt.Errorf("failed to start the first sync of the data source: %w", err),
+				kb.removeFromS3(ctx, ds.BucketARN, objectKeys(docs)),
+			)
 		}
 		if err := kb.checkIngestionJobStatus(ctx, ds.ID, ingestionJobID); err != nil {
 			return nil, fmt.Errorf("failed to check the first sync of the data source: %w", err)
@@ -226,8 +229,10 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 	}
 
 	if err := kb.ingestDocuments(ctx, ds.ID, ds.BucketARN, docs); err != nil {
-		kb.removeFromS3(ctx, ds.BucketARN, docs)
-		return nil, fmt.Errorf("failed to ingest documents: %w", err)
+		return nil, errors.Join(
+			fmt.Errorf("failed to ingest documents: %w", err),
+			kb.removeFromS3(ctx, ds.BucketARN, objectKeys(docs)),
+		)
 	}
 	if err := kb.waitForIndexedDocuments(ctx, ds, docs); err != nil {
 		return nil, err
@@ -235,8 +240,9 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 	return documentNames(docs), nil
 }
 
-// UploadNamedDocuments uploads docs to S3 without triggering per-document Bedrock ingestion.
-// Pair with StartSync once all data sources have been uploaded.
+// UploadNamedDocuments uploads docs to S3 under their names, without ingesting them, and returns those names.
+// If an upload fails, the documents already uploaded are removed. Pair with StartSync once all
+// data sources have been uploaded.
 func (kb *KnowledgeBase) UploadNamedDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
 	opts := kb.getOptions(options...)
 	kb.filterMetadata(docs)
@@ -244,8 +250,8 @@ func (kb *KnowledgeBase) UploadNamedDocuments(ctx context.Context, docs []NamedD
 	if err != nil {
 		return nil, err
 	}
-	if err := kb.addToS3(ctx, ds.BucketARN, docs); err != nil {
-		return nil, fmt.Errorf("failed to upload documents to S3: %w", err)
+	if err := kb.upload(ctx, ds.BucketARN, docs); err != nil {
+		return nil, err
 	}
 	return documentNames(docs), nil
 }

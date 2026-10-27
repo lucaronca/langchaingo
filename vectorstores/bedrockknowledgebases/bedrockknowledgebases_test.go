@@ -57,6 +57,7 @@ type testBedrockAgent struct {
 	ingestionJobStatus     types.IngestionJobStatus
 	documentStatus         types.DocumentStatus
 	ingestErr              error
+	onIngest               func()
 	ingestDocumentsCalls   int
 	startIngestionJobCalls int
 }
@@ -147,6 +148,9 @@ func (t *testBedrockAgent) GetDataSource(_ context.Context, params *bedrockagent
 func (t *testBedrockAgent) IngestKnowledgeBaseDocuments(_ context.Context, _ *bedrockagent.IngestKnowledgeBaseDocumentsInput, _ ...func(*bedrockagent.Options)) (*bedrockagent.IngestKnowledgeBaseDocumentsOutput, error) {
 	t.calls++
 	t.ingestDocumentsCalls++
+	if t.onIngest != nil {
+		t.onIngest()
+	}
 	if t.ingestErr != nil {
 		return nil, t.ingestErr
 	}
@@ -238,13 +242,20 @@ type testS3Client struct {
 	calls int
 	mu    sync.Mutex
 
-	deleted []string
+	failingPutKey string
+	deleteErr     error
+	deleted       []string
 }
 
 var _ s3API = &testS3Client{}
 
-func (t *testS3Client) PutObject(_ context.Context, _ *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+func (t *testS3Client) PutObject(_ context.Context, params *s3.PutObjectInput, _ ...func(*s3.Options)) (*s3.PutObjectOutput, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	t.calls++
+	if aws.ToString(params.Key) == t.failingPutKey {
+		return nil, errors.New("put failed")
+	}
 	return &s3.PutObjectOutput{}, nil
 }
 
@@ -252,6 +263,9 @@ func (t *testS3Client) DeleteObject(_ context.Context, params *s3.DeleteObjectIn
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.calls++
+	if t.deleteErr != nil {
+		return nil, t.deleteErr
+	}
 	t.deleted = append(t.deleted, aws.ToString(params.Key))
 	return &s3.DeleteObjectOutput{}, nil
 }
@@ -434,6 +448,48 @@ func TestKnowledgeBaseAddDocumentsWithIngestionFailure(t *testing.T) {
 	_, err := kb.AddNamedDocuments(ctx, []NamedDocument{{Name: "Mock", Document: schema.Document{PageContent: "Mock"}}})
 	require.ErrorContains(t, err, "ingestion failed")
 	require.Equal(t, []string{"Mock"}, s3Client.deleted, "expected the uploaded document to be removed from S3")
+}
+
+func TestKnowledgeBaseAddDocumentsWithIngestionFailureAfterContextDone(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Parallel()
+
+	testBedrockAgent := &testBedrockAgent{ingestErr: context.Canceled, onIngest: cancel}
+	s3Client := &testS3Client{}
+	kb := newFromClients("testKbWithOneS3Datasource", testBedrockAgent, &testBedrockAgentRuntime{}, s3Client)
+
+	_, err := kb.AddNamedDocuments(ctx, []NamedDocument{{Name: "Mock", Document: schema.Document{PageContent: "Mock"}}})
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, []string{"Mock"}, s3Client.deleted, "expected the uploaded document to be removed from S3")
+}
+
+func TestKnowledgeBaseAddDocumentsWithFailedRemoval(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+
+	testBedrockAgent := &testBedrockAgent{ingestErr: errors.New("ingestion failed")}
+	s3Client := &testS3Client{deleteErr: errors.New("delete failed")}
+	kb := newFromClients("testKbWithOneS3Datasource", testBedrockAgent, &testBedrockAgentRuntime{}, s3Client)
+
+	_, err := kb.AddNamedDocuments(ctx, []NamedDocument{{Name: "Mock", Document: schema.Document{PageContent: "Mock"}}})
+	require.ErrorContains(t, err, "ingestion failed")
+	require.ErrorContains(t, err, "Mock, left in bucket testBucket")
+}
+
+func TestKnowledgeBaseUploadNamedDocumentsWithFailedUpload(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+
+	s3Client := &testS3Client{failingPutKey: "Mock" + _metadataSuffix}
+	kb := newFromClients("testKbWithOneS3Datasource", &testBedrockAgent{}, &testBedrockAgentRuntime{}, s3Client)
+
+	_, err := kb.UploadNamedDocuments(ctx, []NamedDocument{{
+		Name:     "Mock",
+		Document: schema.Document{PageContent: "Mock", Metadata: map[string]any{"type": "tutorial"}},
+	}})
+	require.ErrorContains(t, err, "put failed")
+	require.Equal(t, []string{"Mock"}, s3Client.deleted, "expected only the uploaded object to be removed from S3")
 }
 
 func TestKnowledgeBaseSimilaritySearch(t *testing.T) {
