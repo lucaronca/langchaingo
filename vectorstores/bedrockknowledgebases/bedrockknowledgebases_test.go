@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockagent"
@@ -38,9 +40,17 @@ func (testModel) Call(_ context.Context, _ string, _ ...llms.CallOption) (string
 	return "orange", nil
 }
 
+func TestMain(m *testing.M) {
+	_initialPollInterval = time.Millisecond
+	_maxPollInterval = time.Millisecond
+	os.Exit(m.Run())
+}
+
 type testBedrockAgent struct {
 	calls int
 	mu    sync.Mutex
+
+	ingestionJobStatus types.IngestionJobStatus
 }
 
 var _ bedrockAgentAPI = &testBedrockAgent{}
@@ -142,9 +152,13 @@ func (t *testBedrockAgent) StartIngestionJob(_ context.Context, _ *bedrockagent.
 
 func (t *testBedrockAgent) GetIngestionJob(_ context.Context, _ *bedrockagent.GetIngestionJobInput, _ ...func(*bedrockagent.Options)) (*bedrockagent.GetIngestionJobOutput, error) {
 	t.calls++
+	status := t.ingestionJobStatus
+	if status == "" {
+		status = types.IngestionJobStatusComplete
+	}
 	return &bedrockagent.GetIngestionJobOutput{
 		IngestionJob: &types.IngestionJob{
-			Status: types.IngestionJobStatusComplete,
+			Status: status,
 		},
 	}, nil
 }
@@ -306,6 +320,18 @@ func TestStartSync(t *testing.T) {
 	err := kb.StartSync(ctx, "testS3DatasourceID")
 	require.NoError(t, err)
 	require.Equal(t, 2, agent.calls, "expected 2 calls: StartIngestionJob + GetIngestionJob")
+}
+
+func TestStartSyncWithContextDone(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	t.Parallel()
+
+	agent := &testBedrockAgent{ingestionJobStatus: types.IngestionJobStatusInProgress}
+	kb := newFromClients("testKbId", agent, &testBedrockAgentRuntime{}, &testS3Client{})
+
+	err := kb.StartSync(ctx, "testS3DatasourceID")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestKnowledgeBaseSimilaritySearch(t *testing.T) {

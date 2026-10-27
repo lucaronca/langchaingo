@@ -25,6 +25,12 @@ const (
 	_metadataSuffix = ".metadata.json"
 )
 
+// Variables rather than constants, to let the tests shorten the waits.
+var (
+	_initialPollInterval = time.Second
+	_maxPollInterval     = 10 * time.Second
+)
+
 // dataSource represents a data source for a knowledge base.
 type dataSource struct {
 	ID        string
@@ -226,6 +232,7 @@ func (kb *KnowledgeBase) startIngestionJob(ctx context.Context, datasourceID str
 
 // StartSync triggers a Bedrock ingestion job for the given data source and waits for it to complete.
 // Call this once after all documents have been uploaded across all ingestion tasks.
+// The wait lasts until ctx is done; the returned error then wraps the error of ctx.
 func (kb *KnowledgeBase) StartSync(ctx context.Context, datasourceID string) error {
 	ingestionJobID, err := kb.startIngestionJob(ctx, datasourceID)
 	if err != nil {
@@ -244,33 +251,45 @@ func (kb *KnowledgeBase) StartSync(ctx context.Context, datasourceID string) err
 }
 
 func (kb *KnowledgeBase) checkIngestionJobStatus(ctx context.Context, datasourceID, ingestionJobID string) error {
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
-	defer cancel()
+	return poll(ctx, func(ctx context.Context) (bool, error) {
+		result, err := kb.bedrockAgent.GetIngestionJob(ctx, &bedrockagent.GetIngestionJobInput{
+			KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
+			DataSourceId:    aws.String(datasourceID),
+			IngestionJobId:  aws.String(ingestionJobID),
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to get ingestion job: %w", err)
+		}
+		switch result.IngestionJob.Status {
+		case types.IngestionJobStatusFailed:
+			return false, fmt.Errorf("ingestion job failed: %v", result.IngestionJob.FailureReasons)
+		case types.IngestionJobStatusComplete:
+			return true, nil
+		case types.IngestionJobStatusStopped:
+			return false, errors.New("ingestion job stopped")
+		}
+		return false, nil
+	})
+}
 
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+// poll calls check until it reports done or fails, or until ctx is done. The first call happens after
+// _initialPollInterval, and the interval doubles after each call up to _maxPollInterval.
+func poll(ctx context.Context, check func(ctx context.Context) (done bool, err error)) error {
+	interval := _initialPollInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("ingestion job status check timed out")
-		case <-ticker.C:
-			result, err := kb.bedrockAgent.GetIngestionJob(ctx, &bedrockagent.GetIngestionJobInput{
-				KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
-				DataSourceId:    aws.String(datasourceID),
-				IngestionJobId:  aws.String(ingestionJobID),
-			})
-			if err != nil {
-				return fmt.Errorf("failed to get ingestion job: %w", err)
+			return ctx.Err()
+		case <-timer.C:
+			done, err := check(ctx)
+			if err != nil || done {
+				return err
 			}
-			switch result.IngestionJob.Status {
-			case types.IngestionJobStatusFailed:
-				return fmt.Errorf("ingestion job failed: %v", result.IngestionJob.FailureReasons)
-			case types.IngestionJobStatusComplete:
-				return nil
-			case types.IngestionJobStatusStopped:
-				return fmt.Errorf("ingestion job stopped")
-			}
+			interval = min(2*interval, _maxPollInterval)
+			timer.Reset(interval)
 		}
 	}
 }
