@@ -492,6 +492,22 @@ func TestKnowledgeBaseUploadNamedDocumentsWithFailedUpload(t *testing.T) {
 	require.Equal(t, []string{"Mock"}, s3Client.deleted, "expected only the uploaded object to be removed from S3")
 }
 
+func TestKnowledgeBaseUploadDocuments(t *testing.T) {
+	ctx := context.Background()
+	t.Parallel()
+
+	testBedrockAgent := &testBedrockAgent{}
+	s3Client := &testS3Client{}
+	kb := newFromClients("testKbWithOneS3Datasource", testBedrockAgent, &testBedrockAgentRuntime{}, s3Client)
+
+	ids, err := kb.UploadDocuments(ctx, []schema.Document{{PageContent: "Mock"}})
+	require.NoError(t, err)
+	require.Len(t, ids, 1, "expected 1 id")
+	require.True(t, strings.HasPrefix(ids[0], "kb_doc_"), "expected a generated name")
+	require.Equal(t, 1, s3Client.calls, "expected 1 call to s3Client")
+	require.Equal(t, 0, testBedrockAgent.ingestDocumentsCalls, "expected no direct ingestion")
+}
+
 func TestKnowledgeBaseSimilaritySearch(t *testing.T) {
 	ctx := context.Background()
 	t.Parallel()

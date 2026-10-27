@@ -87,14 +87,7 @@ type NamedDocument struct {
 // AddDocuments adds docs to the knowledge base under generated names and returns those names.
 // The documents are ingested as described in AddNamedDocuments.
 func (kb *KnowledgeBase) AddDocuments(ctx context.Context, docs []schema.Document, options ...vectorstores.Option) ([]string, error) {
-	namedDocs := make([]NamedDocument, len(docs))
-	for i, doc := range docs {
-		namedDocs[i] = NamedDocument{
-			Name:     "kb_doc_" + uuid.NewString(),
-			Document: doc,
-		}
-	}
-	return kb.addDocuments(ctx, namedDocs, options...)
+	return kb.addDocuments(ctx, withGeneratedNames(docs), options...)
 }
 
 // AddNamedDocuments adds docs to the knowledge base under their names and returns those names.
@@ -110,6 +103,17 @@ func (kb *KnowledgeBase) AddDocuments(ctx context.Context, docs []schema.Documen
 // can take a few more minutes to become searchable after the call returns.
 func (kb *KnowledgeBase) AddNamedDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
 	return kb.addDocuments(ctx, docs, options...)
+}
+
+func withGeneratedNames(docs []schema.Document) []NamedDocument {
+	namedDocs := make([]NamedDocument, len(docs))
+	for i, doc := range docs {
+		namedDocs[i] = NamedDocument{
+			Name:     "kb_doc_" + uuid.NewString(),
+			Document: doc,
+		}
+	}
+	return namedDocs
 }
 
 func (kb *KnowledgeBase) filterMetadata(docs []NamedDocument) {
@@ -238,6 +242,13 @@ func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument,
 		return nil, err
 	}
 	return documentNames(docs), nil
+}
+
+// UploadDocuments uploads docs to S3 under generated names, without ingesting them, and returns those names.
+// If an upload fails, the documents already uploaded are removed. Pair with StartSync once all
+// data sources have been uploaded.
+func (kb *KnowledgeBase) UploadDocuments(ctx context.Context, docs []schema.Document, options ...vectorstores.Option) ([]string, error) {
+	return kb.UploadNamedDocuments(ctx, withGeneratedNames(docs), options...)
 }
 
 // UploadNamedDocuments uploads docs to S3 under their names, without ingesting them, and returns those names.
