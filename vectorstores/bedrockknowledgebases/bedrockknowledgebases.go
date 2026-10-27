@@ -2,6 +2,7 @@ package bedrockknowledgebases
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -26,6 +27,8 @@ type bedrockAgentAPI interface {
 	IngestKnowledgeBaseDocuments(ctx context.Context, params *bedrockagent.IngestKnowledgeBaseDocumentsInput, optFns ...func(*bedrockagent.Options)) (*bedrockagent.IngestKnowledgeBaseDocumentsOutput, error)
 	StartIngestionJob(ctx context.Context, params *bedrockagent.StartIngestionJobInput, optFns ...func(*bedrockagent.Options)) (*bedrockagent.StartIngestionJobOutput, error)
 	GetIngestionJob(ctx context.Context, params *bedrockagent.GetIngestionJobInput, optFns ...func(*bedrockagent.Options)) (*bedrockagent.GetIngestionJobOutput, error)
+	ListIngestionJobs(ctx context.Context, params *bedrockagent.ListIngestionJobsInput, optFns ...func(*bedrockagent.Options)) (*bedrockagent.ListIngestionJobsOutput, error)
+	GetKnowledgeBaseDocuments(ctx context.Context, params *bedrockagent.GetKnowledgeBaseDocumentsInput, optFns ...func(*bedrockagent.Options)) (*bedrockagent.GetKnowledgeBaseDocumentsOutput, error)
 }
 
 type bedrockAgentRuntimeAPI interface {
@@ -81,7 +84,28 @@ type NamedDocument struct {
 	Document schema.Document
 }
 
+// AddDocuments adds docs to the knowledge base under generated names and returns those names.
+// The documents are ingested as described in AddNamedDocuments.
 func (kb *KnowledgeBase) AddDocuments(ctx context.Context, docs []schema.Document, options ...vectorstores.Option) ([]string, error) {
+	return kb.addDocuments(ctx, withGeneratedNames(docs), options...)
+}
+
+// AddNamedDocuments adds docs to the knowledge base under their names and returns those names.
+//
+// If an ingestion job is running on the data source, it returns ErrIngestionJobInProgress before
+// uploading anything, because Bedrock does not support ingesting documents directly while a sync is
+// running. Otherwise it uploads the documents to the S3 bucket of the data source. If the data source
+// has never been synced, it starts a sync, which ingests the whole bucket, and waits for it to complete.
+// If it has, it ingests the documents directly and waits until each of them is indexed; a document
+// that ends in any status other than INDEXED makes it return an error that lists those documents.
+//
+// The waits last until ctx is done. Depending on the vector store of the knowledge base, the documents
+// can take a few more minutes to become searchable after the call returns.
+func (kb *KnowledgeBase) AddNamedDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
+	return kb.addDocuments(ctx, docs, options...)
+}
+
+func withGeneratedNames(docs []schema.Document) []NamedDocument {
 	namedDocs := make([]NamedDocument, len(docs))
 	for i, doc := range docs {
 		namedDocs[i] = NamedDocument{
@@ -89,11 +113,7 @@ func (kb *KnowledgeBase) AddDocuments(ctx context.Context, docs []schema.Documen
 			Document: doc,
 		}
 	}
-	return kb.addDocuments(ctx, namedDocs, options...)
-}
-
-func (kb *KnowledgeBase) AddNamedDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
-	return kb.addDocuments(ctx, docs, options...)
+	return namedDocs
 }
 
 func (kb *KnowledgeBase) filterMetadata(docs []NamedDocument) {
@@ -131,22 +151,22 @@ func (kb *KnowledgeBase) filterMetadata(docs []NamedDocument) {
 	}
 }
 
-func (kb *KnowledgeBase) resolveAndUpload(ctx context.Context, docs []NamedDocument, opts *vectorstores.Options) (datasourceID, bucketARN string, names []string, err error) {
-	if err = kb.checkKnowledgeBase(ctx); err != nil {
-		return "", "", nil, fmt.Errorf("failed to validate knowledge base: %w", err)
+func (kb *KnowledgeBase) resolveDataSource(ctx context.Context, opts *vectorstores.Options) (dataSource, error) {
+	if err := kb.checkKnowledgeBase(ctx); err != nil {
+		return dataSource{}, fmt.Errorf("failed to validate knowledge base: %w", err)
 	}
 	compatibleDs, incompatibleDs, err := kb.listDataSources(ctx)
 	if err != nil {
-		return "", "", nil, fmt.Errorf("failed to list data sources: %w", err)
+		return dataSource{}, fmt.Errorf("failed to list data sources: %w", err)
 	}
 	if len(compatibleDs) == 0 {
 		if len(incompatibleDs) > 0 {
-			return "", "", nil, fmt.Errorf(
+			return dataSource{}, fmt.Errorf(
 				"found data sources but none with S3 type, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
 				kb.knowledgeBaseID,
 			)
 		}
-		return "", "", nil, fmt.Errorf(
+		return dataSource{}, fmt.Errorf(
 			"no data sources with S3 type found, please create a data source with S3 type for the knowledge base with id: %s in the AWS console",
 			kb.knowledgeBaseID,
 		)
@@ -155,56 +175,96 @@ func (kb *KnowledgeBase) resolveAndUpload(ctx context.Context, docs []NamedDocum
 	if opts.NameSpace != "" {
 		for _, ds := range compatibleDs {
 			if ds.ID == opts.NameSpace {
-				datasourceID = ds.ID
-				bucketARN = ds.BucketARN
-				break
+				return ds, nil
 			}
 		}
-		if datasourceID == "" {
-			return "", "", nil, fmt.Errorf("data source with S3 type with id %s not found", opts.NameSpace)
-		}
-	} else if len(compatibleDs) == 1 {
-		datasourceID = compatibleDs[0].ID
-		bucketARN = compatibleDs[0].BucketARN
-	} else {
-		return "", "", nil, fmt.Errorf("multiple data sources with S3 type found, please specify which one you want to use by passing its id with the `vectorstores.WithNameSpace` option")
+		return dataSource{}, fmt.Errorf("data source with S3 type with id %s not found", opts.NameSpace)
 	}
-
-	if err = kb.addToS3(ctx, bucketARN, docs); err != nil {
-		return "", "", nil, fmt.Errorf("failed to upload documents to S3: %w", err)
+	if len(compatibleDs) == 1 {
+		return compatibleDs[0], nil
 	}
+	return dataSource{}, fmt.Errorf("multiple data sources with S3 type found, please specify which one you want to use by passing its id with the `vectorstores.WithNameSpace` option")
+}
 
-	names = make([]string, len(docs))
+func documentNames(docs []NamedDocument) []string {
+	names := make([]string, len(docs))
 	for i, doc := range docs {
 		names[i] = doc.Name
 	}
-	return datasourceID, bucketARN, names, nil
+	return names
 }
 
 func (kb *KnowledgeBase) addDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
 	opts := kb.getOptions(options...)
 	kb.filterMetadata(docs)
-	datasourceID, bucketARN, names, err := kb.resolveAndUpload(ctx, docs, opts)
+	ds, err := kb.resolveDataSource(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	if err := kb.ingestDocuments(ctx, datasourceID, bucketARN, docs); err != nil {
-		kb.removeFromS3(ctx, bucketARN, docs)
-		return nil, fmt.Errorf("failed to ingest documents: %w", err)
+
+	running, err := kb.hasRunningIngestionJob(ctx, ds.ID)
+	if err != nil {
+		return nil, err
 	}
-	return names, nil
+	if running {
+		return nil, ErrIngestionJobInProgress
+	}
+	synced, err := kb.hasCompletedIngestionJob(ctx, ds.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := kb.upload(ctx, ds.BucketARN, docs); err != nil {
+		return nil, err
+	}
+
+	if !synced {
+		ingestionJobID, err := kb.startIngestionJob(ctx, ds.ID)
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("failed to start the first sync of the data source: %w", err),
+				kb.removeFromS3(ctx, ds.BucketARN, objectKeys(docs)),
+			)
+		}
+		if err := kb.checkIngestionJobStatus(ctx, ds.ID, ingestionJobID); err != nil {
+			return nil, fmt.Errorf("failed to check the first sync of the data source: %w", err)
+		}
+		return documentNames(docs), nil
+	}
+
+	if err := kb.ingestDocuments(ctx, ds.ID, ds.BucketARN, docs); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("failed to ingest documents: %w", err),
+			kb.removeFromS3(ctx, ds.BucketARN, objectKeys(docs)),
+		)
+	}
+	if err := kb.waitForIndexedDocuments(ctx, ds, docs); err != nil {
+		return nil, err
+	}
+	return documentNames(docs), nil
 }
 
-// UploadNamedDocuments uploads docs to S3 without triggering per-document Bedrock ingestion.
-// Pair with StartSync once all data sources have been uploaded.
+// UploadDocuments uploads docs to S3 under generated names, without ingesting them, and returns those names.
+// If an upload fails, the documents already uploaded are removed. Pair with StartSync once all
+// data sources have been uploaded.
+func (kb *KnowledgeBase) UploadDocuments(ctx context.Context, docs []schema.Document, options ...vectorstores.Option) ([]string, error) {
+	return kb.UploadNamedDocuments(ctx, withGeneratedNames(docs), options...)
+}
+
+// UploadNamedDocuments uploads docs to S3 under their names, without ingesting them, and returns those names.
+// If an upload fails, the documents already uploaded are removed. Pair with StartSync once all
+// data sources have been uploaded.
 func (kb *KnowledgeBase) UploadNamedDocuments(ctx context.Context, docs []NamedDocument, options ...vectorstores.Option) ([]string, error) {
 	opts := kb.getOptions(options...)
 	kb.filterMetadata(docs)
-	_, _, names, err := kb.resolveAndUpload(ctx, docs, opts)
+	ds, err := kb.resolveDataSource(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
-	return names, nil
+	if err := kb.upload(ctx, ds.BucketARN, docs); err != nil {
+		return nil, err
+	}
+	return documentNames(docs), nil
 }
 
 func (kb *KnowledgeBase) SimilaritySearch(ctx context.Context, query string, numDocuments int, options ...vectorstores.Option) (
@@ -361,6 +421,8 @@ func (kb *KnowledgeBase) unmarshalMetadataValue(value document.Interface) (any, 
 			return nil, err
 		}
 		return float32(floatValue), nil
+	case float64:
+		return float32(value), nil
 	}
 	return v, nil
 }

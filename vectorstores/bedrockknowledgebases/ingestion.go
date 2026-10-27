@@ -23,7 +23,26 @@ import (
 
 const (
 	_metadataSuffix = ".metadata.json"
+	// _documentsBatchSize is the number of documents per IngestKnowledgeBaseDocuments and
+	// GetKnowledgeBaseDocuments request; GetKnowledgeBaseDocuments accepts at most 10.
+	_documentsBatchSize = 10
 )
+
+// Variables rather than constants, to let the tests shorten the waits.
+var (
+	_initialPollInterval = time.Second
+	_maxPollInterval     = 10 * time.Second
+)
+
+// ErrIngestionJobInProgress is returned by AddDocuments and AddNamedDocuments when an ingestion job
+// is running on the data source.
+var ErrIngestionJobInProgress = errors.New("an ingestion job is in progress on the data source")
+
+var _runningIngestionJobStatuses = []types.IngestionJobStatus{
+	types.IngestionJobStatusStarting,
+	types.IngestionJobStatusInProgress,
+	types.IngestionJobStatusStopping,
+}
 
 // dataSource represents a data source for a knowledge base.
 type dataSource struct {
@@ -121,10 +140,9 @@ func (r ingestDocumentsRetryer) IsErrorRetryable(err error) bool {
 // Returns an error if any request fails.
 func (kb *KnowledgeBase) ingestDocuments(ctx context.Context, datasourceID, bucketArn string, docs []NamedDocument) error {
 	bucketName := kb.getBucketName(bucketArn)
-	const batchSize = 10
 
-	for i := 0; i < len(docs); i += batchSize {
-		end := i + batchSize
+	for i := 0; i < len(docs); i += _documentsBatchSize {
+		end := i + _documentsBatchSize
 		if end > len(docs) {
 			end = len(docs)
 		}
@@ -226,6 +244,7 @@ func (kb *KnowledgeBase) startIngestionJob(ctx context.Context, datasourceID str
 
 // StartSync triggers a Bedrock ingestion job for the given data source and waits for it to complete.
 // Call this once after all documents have been uploaded across all ingestion tasks.
+// The wait lasts until ctx is done; the returned error then wraps the error of ctx.
 func (kb *KnowledgeBase) StartSync(ctx context.Context, datasourceID string) error {
 	ingestionJobID, err := kb.startIngestionJob(ctx, datasourceID)
 	if err != nil {
@@ -244,33 +263,135 @@ func (kb *KnowledgeBase) StartSync(ctx context.Context, datasourceID string) err
 }
 
 func (kb *KnowledgeBase) checkIngestionJobStatus(ctx context.Context, datasourceID, ingestionJobID string) error {
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
-	defer cancel()
+	return poll(ctx, func(ctx context.Context) (bool, error) {
+		result, err := kb.bedrockAgent.GetIngestionJob(ctx, &bedrockagent.GetIngestionJobInput{
+			KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
+			DataSourceId:    aws.String(datasourceID),
+			IngestionJobId:  aws.String(ingestionJobID),
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to get ingestion job: %w", err)
+		}
+		switch result.IngestionJob.Status {
+		case types.IngestionJobStatusFailed:
+			return false, fmt.Errorf("ingestion job failed: %v", result.IngestionJob.FailureReasons)
+		case types.IngestionJobStatusComplete:
+			return true, nil
+		case types.IngestionJobStatusStopped:
+			return false, errors.New("ingestion job stopped")
+		}
+		return false, nil
+	})
+}
 
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+// poll calls check until it reports done or fails, or until ctx is done. The first call happens after
+// _initialPollInterval, and the interval doubles after each call up to _maxPollInterval.
+func poll(ctx context.Context, check func(ctx context.Context) (done bool, err error)) error {
+	interval := _initialPollInterval
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("ingestion job status check timed out")
-		case <-ticker.C:
-			result, err := kb.bedrockAgent.GetIngestionJob(ctx, &bedrockagent.GetIngestionJobInput{
-				KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
-				DataSourceId:    aws.String(datasourceID),
-				IngestionJobId:  aws.String(ingestionJobID),
-			})
-			if err != nil {
-				return fmt.Errorf("failed to get ingestion job: %w", err)
+			return ctx.Err()
+		case <-timer.C:
+			done, err := check(ctx)
+			if err != nil || done {
+				return err
 			}
-			switch result.IngestionJob.Status {
-			case types.IngestionJobStatusFailed:
-				return fmt.Errorf("ingestion job failed: %v", result.IngestionJob.FailureReasons)
-			case types.IngestionJobStatusComplete:
-				return nil
-			case types.IngestionJobStatusStopped:
-				return fmt.Errorf("ingestion job stopped")
-			}
+			interval = min(2*interval, _maxPollInterval)
+			timer.Reset(interval)
 		}
 	}
+}
+
+func (kb *KnowledgeBase) hasRunningIngestionJob(ctx context.Context, datasourceID string) (bool, error) {
+	return kb.hasIngestionJob(ctx, datasourceID, _runningIngestionJobStatuses...)
+}
+
+func (kb *KnowledgeBase) hasCompletedIngestionJob(ctx context.Context, datasourceID string) (bool, error) {
+	return kb.hasIngestionJob(ctx, datasourceID, types.IngestionJobStatusComplete)
+}
+
+// hasIngestionJob reports whether the data source has at least one ingestion job in any of statuses.
+func (kb *KnowledgeBase) hasIngestionJob(ctx context.Context, datasourceID string, statuses ...types.IngestionJobStatus) (bool, error) {
+	values := make([]string, len(statuses))
+	for i, status := range statuses {
+		values[i] = string(status)
+	}
+	result, err := kb.bedrockAgent.ListIngestionJobs(ctx, &bedrockagent.ListIngestionJobsInput{
+		KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
+		DataSourceId:    aws.String(datasourceID),
+		Filters: []types.IngestionJobFilter{{
+			Attribute: types.IngestionJobFilterAttributeStatus,
+			Operator:  types.IngestionJobFilterOperatorEq,
+			Values:    values,
+		}},
+		MaxResults: aws.Int32(1),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to list ingestion jobs: %w", err)
+	}
+	return len(result.IngestionJobSummaries) > 0, nil
+}
+
+// waitForIndexedDocuments waits until every document of docs has a final ingestion status. It returns an
+// error that lists the documents whose final status is not INDEXED, with the reason Bedrock gives.
+func (kb *KnowledgeBase) waitForIndexedDocuments(ctx context.Context, ds dataSource, docs []NamedDocument) error {
+	bucketName := kb.getBucketName(ds.BucketARN)
+	pending := make([]string, len(docs))
+	for i, doc := range docs {
+		pending[i] = "s3://" + bucketName + "/" + doc.Name
+	}
+	var notIndexed []string
+
+	return poll(ctx, func(ctx context.Context) (bool, error) {
+		var stillPending []string
+		for i := 0; i < len(pending); i += _documentsBatchSize {
+			batch := pending[i:min(i+_documentsBatchSize, len(pending))]
+			identifiers := make([]types.DocumentIdentifier, len(batch))
+			for j, uri := range batch {
+				identifiers[j] = types.DocumentIdentifier{
+					DataSourceType: types.ContentDataSourceTypeS3,
+					S3:             &types.S3Location{Uri: aws.String(uri)},
+				}
+			}
+			result, err := kb.bedrockAgent.GetKnowledgeBaseDocuments(ctx, &bedrockagent.GetKnowledgeBaseDocumentsInput{
+				KnowledgeBaseId:     aws.String(kb.knowledgeBaseID),
+				DataSourceId:        aws.String(ds.ID),
+				DocumentIdentifiers: identifiers,
+			})
+			if err != nil {
+				return false, fmt.Errorf("failed to get documents: %w", err)
+			}
+
+			reported := make(map[string]bool, len(result.DocumentDetails))
+			for _, detail := range result.DocumentDetails {
+				uri := aws.ToString(detail.Identifier.S3.Uri)
+				reported[uri] = true
+				switch detail.Status {
+				case types.DocumentStatusStarting, types.DocumentStatusPending, types.DocumentStatusInProgress:
+					stillPending = append(stillPending, uri)
+				case types.DocumentStatusIndexed:
+				default:
+					notIndexed = append(notIndexed, fmt.Sprintf("%s (%s %s)", uri, detail.Status, aws.ToString(detail.StatusReason)))
+				}
+			}
+			for _, uri := range batch {
+				if !reported[uri] {
+					stillPending = append(stillPending, uri)
+				}
+			}
+		}
+
+		pending = stillPending
+		if len(pending) > 0 {
+			return false, nil
+		}
+		if len(notIndexed) > 0 {
+			return true, fmt.Errorf("documents not indexed: %s", strings.Join(notIndexed, ", "))
+		}
+		return true, nil
+	})
 }
