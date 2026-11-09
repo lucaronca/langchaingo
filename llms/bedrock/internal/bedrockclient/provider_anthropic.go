@@ -106,6 +106,18 @@ type anthropicTextGenerationInput struct {
 		TagSuffix            string `json:"tagSuffix,omitempty"`
 		StreamProcessingMode string `json:"streamProcessingMode,omitempty"`
 	} `json:"amazon-bedrock-guardrailConfig,omitempty"`
+	// Thinking configuration. Optional
+	Thinking *anthropicThinking `json:"thinking,omitempty"`
+	// Output configuration, such as the effort level. Optional
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type string `json:"type"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort"`
 }
 
 // anthropicTextGenerationOutput is the generated output.
@@ -198,6 +210,7 @@ const (
 func createAnthropicCompletion(ctx context.Context,
 	client *bedrockruntime.Client,
 	modelID string,
+	invocationID string,
 	messages []Message,
 	options llms.CallOptions,
 ) (*llms.ContentResponse, error) {
@@ -257,16 +270,20 @@ func createAnthropicCompletion(ctx context.Context,
 		}
 	}
 
+	if err := applyAnthropicModelRules(&input, modelID, options); err != nil {
+		return nil, err
+	}
+
 	body, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
 	}
 
 	if options.StreamingFunc != nil {
-		return parseStreamingCompletionResponse(ctx, client, modelID, body, options)
+		return parseStreamingCompletionResponse(ctx, client, invocationID, body, options)
 	}
 
-	resp, err := invokeModel(ctx, client, modelID, body, options)
+	resp, err := invokeModel(ctx, client, invocationID, body, options)
 	if err != nil {
 		return nil, err
 	}
@@ -371,8 +388,8 @@ func parseStreamingCompletionResponse(ctx context.Context, client invokeModelWit
 }
 
 // handleAnthropicStreamingChunk records one streamed chunk in choice, passes
-// delta text to options.StreamingFunc, and returns the refusal error when the
-// stream ends in a refusal.
+// the text of text deltas to options.StreamingFunc, and returns the refusal
+// error when the stream ends in a refusal.
 func handleAnthropicStreamingChunk(ctx context.Context, resp streamingCompletionResponseChunk, choice *llms.ContentChoice, options llms.CallOptions) error {
 	switch resp.Type {
 	case "message_start":
@@ -380,6 +397,9 @@ func handleAnthropicStreamingChunk(ctx context.Context, resp streamingCompletion
 		choice.GenerationInfo["CacheCreationInputTokens"] = resp.Message.Usage.CacheCreationInputTokens
 		choice.GenerationInfo["CacheReadInputTokens"] = resp.Message.Usage.CacheReadInputTokens
 	case "content_block_delta":
+		if resp.Delta.Type != "text_delta" {
+			return nil
+		}
 		if err := options.StreamingFunc(ctx, []byte(resp.Delta.Text)); err != nil {
 			return err
 		}

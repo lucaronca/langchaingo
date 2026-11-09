@@ -72,7 +72,7 @@ func TestCreateAnthropicCompletionReturnsRefusals(t *testing.T) {
 			client := newRespondingBedrockClient(t, tt.responseBody)
 			messages := []Message{{Role: llms.ChatMessageTypeHuman, Type: "text", Content: "Hi"}}
 
-			resp, err := createAnthropicCompletion(context.Background(), client, "anthropic.claude-sonnet-5-5", messages, llms.CallOptions{})
+			resp, err := createAnthropicCompletion(context.Background(), client, "anthropic.claude-sonnet-5-5", "anthropic.claude-sonnet-5-5", messages, llms.CallOptions{})
 
 			assert.Nil(t, resp)
 			requireRefusalError(t, err, tt.wantCategory, tt.wantExplanation)

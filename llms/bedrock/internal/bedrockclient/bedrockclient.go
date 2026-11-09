@@ -74,9 +74,13 @@ func NewClient(client *bedrockruntime.Client) *Client {
 
 // CreateCompletion creates a new completion response from the provider
 // after sending the messages to the provider.
+//
+// modelID names the model and decides how the request is built.
+// invocationID is the ID the request is sent to, such as an inference profile.
 func (c *Client) CreateCompletion(ctx context.Context,
 	provider string,
 	modelID string,
+	invocationID string,
 	messages []Message,
 	options llms.CallOptions,
 ) (*llms.ContentResponse, error) {
@@ -85,17 +89,17 @@ func (c *Client) CreateCompletion(ctx context.Context,
 	}
 	switch provider {
 	case "ai21":
-		return createAi21Completion(ctx, c.client, modelID, messages, options)
+		return createAi21Completion(ctx, c.client, invocationID, messages, options)
 	case "amazon":
-		return createAmazonCompletion(ctx, c.client, modelID, messages, options)
+		return createAmazonCompletion(ctx, c.client, invocationID, messages, options)
 	case "nova":
-		return createNovaCompletion(ctx, c.client, modelID, messages, options)
+		return createNovaCompletion(ctx, c.client, invocationID, messages, options)
 	case "anthropic":
-		return createAnthropicCompletion(ctx, c.client, modelID, messages, options)
+		return createAnthropicCompletion(ctx, c.client, modelID, invocationID, messages, options)
 	case "cohere":
-		return createCohereCompletion(ctx, c.client, modelID, messages, options)
+		return createCohereCompletion(ctx, c.client, invocationID, messages, options)
 	case "meta":
-		return createMetaCompletion(ctx, c.client, modelID, messages, options)
+		return createMetaCompletion(ctx, c.client, invocationID, messages, options)
 	default:
 		return nil, errors.New("unsupported provider")
 	}
