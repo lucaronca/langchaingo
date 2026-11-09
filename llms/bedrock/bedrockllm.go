@@ -17,6 +17,7 @@ const defaultModel = ModelAmazonTitanTextLiteV1
 type LLM struct {
 	modelProvider    string
 	modelID          string
+	inferenceProfile string
 	client           *bedrockclient.Client
 	CallbacksHandler callbacks.Handler
 }
@@ -36,6 +37,7 @@ func NewWithContext(ctx context.Context, opts ...Option) (*LLM, error) {
 		client:           c,
 		modelProvider:    o.modelProvider,
 		modelID:          o.modelID,
+		inferenceProfile: o.inferenceProfile,
 		CallbacksHandler: o.callbackHandler,
 	}, nil
 }
@@ -83,7 +85,12 @@ func (l *LLM) GenerateContent(ctx context.Context, messages []llms.MessageConten
 		return nil, err
 	}
 
-	res, err := l.client.CreateCompletion(ctx, l.modelProvider, opts.Model, m, opts)
+	invocationID := opts.Model
+	if l.inferenceProfile != "" && opts.Model == l.modelID {
+		invocationID = l.inferenceProfile
+	}
+
+	res, err := l.client.CreateCompletion(ctx, l.modelProvider, opts.Model, invocationID, m, opts)
 	if err != nil {
 		if l.CallbacksHandler != nil {
 			l.CallbacksHandler.HandleLLMError(ctx, err)

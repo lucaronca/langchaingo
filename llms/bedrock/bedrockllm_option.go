@@ -9,26 +9,34 @@ import (
 type Option func(*options)
 
 type options struct {
-	modelProvider   string
-	modelID         string
-	client          *bedrockruntime.Client
-	callbackHandler callbacks.Handler
+	modelProvider    string
+	modelID          string
+	inferenceProfile string
+	client           *bedrockruntime.Client
+	callbackHandler  callbacks.Handler
 }
 
-// WithModel allows setting a custom modelId.
+// WithModel sets the ID of the model, such as "anthropic.claude-sonnet-5-5".
 //
-// If not set, the default model is used
-// i.e. "amazon.titan-text-lite-v1".
+// The model ID decides how requests are built and, unless WithModelProvider is set, which provider handles them. Requests are sent to this model unless WithInferenceProfile is set. If not set, ModelAmazonTitanTextLiteV1 is used.
 func WithModel(modelID string) Option {
 	return func(o *options) {
 		o.modelID = modelID
 	}
 }
 
-// WithModelProvider allows setting a custom model provider.
+// WithInferenceProfile sets the ID or ARN of the inference profile that requests are sent to.
 //
-// If not set, the default model provider is used
-// i.e. "anthropic".
+// When set, requests go to the inference profile instead of the model set with WithModel. The model set with WithModel and the provider set with WithModelProvider still decide how requests are built, so the caller must keep them consistent with the model the inference profile routes to.
+func WithInferenceProfile(inferenceProfile string) Option {
+	return func(o *options) {
+		o.inferenceProfile = inferenceProfile
+	}
+}
+
+// WithModelProvider sets the provider of the model, such as "anthropic" or "meta".
+//
+// If not set, the provider is derived from the model ID. Set it when the model ID does not name the provider.
 func WithModelProvider(modelProvider string) Option {
 	return func(o *options) {
 		o.modelProvider = modelProvider

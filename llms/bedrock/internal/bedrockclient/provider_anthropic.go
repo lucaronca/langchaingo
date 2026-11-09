@@ -81,6 +81,18 @@ type anthropicTextGenerationInput struct {
 	Tools []BedrockTool `json:"tools,omitempty"`
 	// Tool choice configuration. Optional
 	ToolChoice *BedrockToolChoice `json:"tool_choice,omitempty"`
+	// Thinking configuration. Optional
+	Thinking *anthropicThinking `json:"thinking,omitempty"`
+	// Output configuration, such as the effort level. Optional
+	OutputConfig *anthropicOutputConfig `json:"output_config,omitempty"`
+}
+
+type anthropicThinking struct {
+	Type string `json:"type"`
+}
+
+type anthropicOutputConfig struct {
+	Effort string `json:"effort"`
 }
 
 // anthropicTextGenerationOutput is the generated output.
@@ -145,6 +157,7 @@ const (
 func createAnthropicCompletion(ctx context.Context,
 	client *bedrockruntime.Client,
 	modelID string,
+	invocationID string,
 	messages []Message,
 	options llms.CallOptions,
 ) (*llms.ContentResponse, error) {
@@ -182,6 +195,10 @@ func createAnthropicCompletion(ctx context.Context,
 		}
 	}
 
+	if err := applyAnthropicModelRules(&input, modelID, options); err != nil {
+		return nil, err
+	}
+
 	body, err := json.Marshal(input)
 	if err != nil {
 		return nil, err
@@ -189,7 +206,7 @@ func createAnthropicCompletion(ctx context.Context,
 
 	if options.StreamingFunc != nil {
 		modelInput := &bedrockruntime.InvokeModelWithResponseStreamInput{
-			ModelId:     aws.String(modelID),
+			ModelId:     aws.String(invocationID),
 			Accept:      aws.String("*/*"),
 			ContentType: aws.String("application/json"),
 			Body:        body,
@@ -198,7 +215,7 @@ func createAnthropicCompletion(ctx context.Context,
 	}
 
 	modelInput := &bedrockruntime.InvokeModelInput{
-		ModelId:     aws.String(modelID),
+		ModelId:     aws.String(invocationID),
 		Accept:      aws.String("*/*"),
 		ContentType: aws.String("application/json"),
 		Body:        body,
@@ -319,18 +336,8 @@ func parseStreamingCompletionResponse(ctx context.Context, client *bedrockruntim
 			if err != nil {
 				return nil, err
 			}
-
-			switch resp.Type {
-			case "message_start":
-				contentchoices[0].GenerationInfo["input_tokens"] = resp.Message.Usage.InputTokens
-			case "content_block_delta":
-				if err = options.StreamingFunc(ctx, []byte(resp.Delta.Text)); err != nil {
-					return nil, err
-				}
-				contentchoices[0].Content += resp.Delta.Text
-			case "message_delta":
-				contentchoices[0].StopReason = resp.Delta.StopReason
-				contentchoices[0].GenerationInfo["output_tokens"] = resp.Usage.OutputTokens
+			if err := handleAnthropicStreamingChunk(ctx, resp, contentchoices[0], options); err != nil {
+				return nil, err
 			}
 		}
 	}
@@ -341,6 +348,27 @@ func parseStreamingCompletionResponse(ctx context.Context, client *bedrockruntim
 	return &llms.ContentResponse{
 		Choices: contentchoices,
 	}, nil
+}
+
+// handleAnthropicStreamingChunk records one streamed chunk in choice and
+// passes the text of text deltas to options.StreamingFunc.
+func handleAnthropicStreamingChunk(ctx context.Context, resp streamingCompletionResponseChunk, choice *llms.ContentChoice, options llms.CallOptions) error {
+	switch resp.Type {
+	case "message_start":
+		choice.GenerationInfo["input_tokens"] = resp.Message.Usage.InputTokens
+	case "content_block_delta":
+		if resp.Delta.Type != "text_delta" {
+			return nil
+		}
+		if err := options.StreamingFunc(ctx, []byte(resp.Delta.Text)); err != nil {
+			return err
+		}
+		choice.Content += resp.Delta.Text
+	case "message_delta":
+		choice.StopReason = resp.Delta.StopReason
+		choice.GenerationInfo["output_tokens"] = resp.Usage.OutputTokens
+	}
+	return nil
 }
 
 // process the input messages to anthropic supported input
