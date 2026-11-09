@@ -307,26 +307,29 @@ func poll(ctx context.Context, check func(ctx context.Context) (done bool, err e
 }
 
 func (kb *KnowledgeBase) hasRunningIngestionJob(ctx context.Context, datasourceID string) (bool, error) {
-	return kb.hasIngestionJob(ctx, datasourceID, _runningIngestionJobStatuses...)
+	for _, status := range _runningIngestionJobStatuses {
+		found, err := kb.hasIngestionJob(ctx, datasourceID, status)
+		if err != nil || found {
+			return found, err
+		}
+	}
+	return false, nil
 }
 
 func (kb *KnowledgeBase) hasCompletedIngestionJob(ctx context.Context, datasourceID string) (bool, error) {
 	return kb.hasIngestionJob(ctx, datasourceID, types.IngestionJobStatusComplete)
 }
 
-// hasIngestionJob reports whether the data source has at least one ingestion job in any of statuses.
-func (kb *KnowledgeBase) hasIngestionJob(ctx context.Context, datasourceID string, statuses ...types.IngestionJobStatus) (bool, error) {
-	values := make([]string, len(statuses))
-	for i, status := range statuses {
-		values[i] = string(status)
-	}
+// hasIngestionJob reports whether the data source has at least one ingestion job in status.
+// ListIngestionJobs matches a status filter against its first value only, so each status needs its own call.
+func (kb *KnowledgeBase) hasIngestionJob(ctx context.Context, datasourceID string, status types.IngestionJobStatus) (bool, error) {
 	result, err := kb.bedrockAgent.ListIngestionJobs(ctx, &bedrockagent.ListIngestionJobsInput{
 		KnowledgeBaseId: aws.String(kb.knowledgeBaseID),
 		DataSourceId:    aws.String(datasourceID),
 		Filters: []types.IngestionJobFilter{{
 			Attribute: types.IngestionJobFilterAttributeStatus,
 			Operator:  types.IngestionJobFilterOperatorEq,
-			Values:    values,
+			Values:    []string{string(status)},
 		}},
 		MaxResults: aws.Int32(1),
 	})
@@ -394,4 +397,36 @@ func (kb *KnowledgeBase) waitForIndexedDocuments(ctx context.Context, ds dataSou
 		}
 		return true, nil
 	})
+}
+
+// waitForSearchableDocuments waits until Retrieve returns at least one chunk of every document of docs. When
+// ctx is done first, the returned error lists the documents not searchable yet.
+func (kb *KnowledgeBase) waitForSearchableDocuments(ctx context.Context, ds dataSource, docs []NamedDocument) error {
+	bucketName := kb.getBucketName(ds.BucketARN)
+	pending := make([]string, len(docs))
+	for i, doc := range docs {
+		pending[i] = "s3://" + bucketName + "/" + doc.Name
+	}
+
+	err := poll(ctx, func(ctx context.Context) (bool, error) {
+		var stillPending []string
+		for i := 0; i < len(pending); i += _documentsBatchSize {
+			batch := pending[i:min(i+_documentsBatchSize, len(pending))]
+			found, err := kb.searchableSourceURIs(ctx, batch)
+			if err != nil {
+				return false, fmt.Errorf("failed to retrieve documents: %w", err)
+			}
+			for _, uri := range batch {
+				if !found[uri] {
+					stillPending = append(stillPending, uri)
+				}
+			}
+		}
+		pending = stillPending
+		return len(pending) == 0, nil
+	})
+	if err != nil {
+		return fmt.Errorf("documents not searchable yet (%s): %w", strings.Join(pending, ", "), err)
+	}
+	return nil
 }
